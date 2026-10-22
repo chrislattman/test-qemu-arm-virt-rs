@@ -1,0 +1,18 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Rust: Remote Attach",
+            "type": "gdb",
+            "request": "attach",
+            "executable": "${workspaceFolder}/target/aarch64-unknown-none-softfloat/debug/baremetal",
+            "cwd": "${workspaceFolder}",
+            "target": "localhost:1234",
+            "remote": true,
+            "gdbpath": "${userHome}/.cargo/bin/rust-gdb",
+            "env": {
+                "RUST_GDB": "gdb-multiarch"
+            }
+        }
+    ]
+}
