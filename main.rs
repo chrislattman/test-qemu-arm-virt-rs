@@ -3,65 +3,76 @@
 // Debug builds compile out the sleeps and interrupts in main_app, leaving their helpers unused
 #![cfg_attr(debug_assertions, allow(dead_code))]
 
+use arm_gic::gicv2::registers::{Gicc, Gicd};
+use arm_gic::gicv2::{GicV2, SgiTarget, SgiTargetListFilter};
+use arm_gic::{IntId, InterruptGroup};
+use arm_pl011_uart::{PL011Registers, Uart, UniqueMmioPointer};
 use core::arch::asm;
+use core::cell::UnsafeCell;
+use core::fmt::Write;
 use core::panic::PanicInfo;
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 // Core Entry Point Setup
 core::arch::global_asm!(include_str!("startup.S"));
 
-// --- UART PL011 Constants ---
-const UART0_BASE: usize = 0x0900_0000;
-const UART0_DR: *mut u32 = UART0_BASE as *mut u32;
-const UART0_FR: *const u32 = (UART0_BASE + 0x18) as *const u32;
-const UART_FR_TXFF: u32 = 1 << 5;
-
-// --- GICv2 (QEMU virt Memory Map) ---
-const GIC_DIST_BASE: usize = 0x0800_0000; // Distributor Base Address
-const GIC_CPU_BASE: usize = 0x0801_0000; // CPU Interface Base Address
-
-// Distributor Registers
-const GICD_CTLR: *mut u32 = GIC_DIST_BASE as *mut u32;
-const GICD_ISENABLER: *mut u32 = (GIC_DIST_BASE + 0x100) as *mut u32;
-const GICD_SGIR: *mut u32 = (GIC_DIST_BASE + 0xF00) as *mut u32;
-
-// CPU Interface Registers
-const GICC_CTLR: *mut u32 = GIC_CPU_BASE as *mut u32;
-const GICC_PMR: *mut u32 = (GIC_CPU_BASE + 0x004) as *mut u32;
-const GICC_IAR: *const u32 = (GIC_CPU_BASE + 0x00C) as *const u32;
-const GICC_EOIR: *mut u32 = (GIC_CPU_BASE + 0x010) as *mut u32;
+// --- QEMU virt Memory Map ---
+const UART0_BASE: usize = 0x0900_0000; // PL011 UART
+const GIC_DIST_BASE: usize = 0x0800_0000; // GICv2 Distributor Base Address
+const GIC_CPU_BASE: usize = 0x0801_0000; // GICv2 CPU Interface Base Address
 
 // Assigning SGI IDs
-const HW_INT_SGI_ID: u32 = 1;
-const SW_INT_SGI_ID: u32 = 2;
+const HW_INT_SGI_ID: IntId = IntId::sgi(1);
+const SW_INT_SGI_ID: IntId = IntId::sgi(2);
 
 // Shared variable across foreground code and async ISR layers
 static SHARED_DATA: AtomicU32 = AtomicU32::new(0);
 
-fn uart_putc(byte: u8) {
-    unsafe {
-        // Wait until UART TX FIFO has space
-        while (read_volatile(UART0_FR) & UART_FR_TXFF) != 0 {}
-        write_volatile(UART0_DR, byte as u32);
+/// A driver used by both main_app and handle_irq. The drivers need `&mut self`, so access is
+/// only handed out with IRQs masked, which on this single core makes it exclusive.
+struct IrqShared<T>(UnsafeCell<T>);
+
+// SAFETY: Only core 0 runs Rust code, and `with` masks the only other context (IRQs)
+unsafe impl<T> Sync for IrqShared<T> {}
+
+impl<T> IrqShared<T> {
+    const fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    /// Runs `f` with IRQs masked, then restores the previous mask (so it's safe inside handle_irq).
+    /// `f` must not call `with` on the same value again.
+    fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let daif: u64;
+        // No `nomem` option, so these also act as compiler memory barriers
+        unsafe {
+            asm!("mrs {}, daif", "msr daifset, #2", out(reg) daif, options(nostack));
+        }
+        let result = f(unsafe { &mut *self.0.get() });
+        unsafe {
+            asm!("msr daif, {}", in(reg) daif, options(nostack));
+        }
+        result
     }
 }
+
+// QEMU leaves the PL011 enabled at reset, so it can be used without calling Uart::enable()
+static UART: IrqShared<Uart<'static>> = IrqShared::new(Uart::new(
+    // SAFETY: UART0_BASE is the PL011 on QEMU virt, the MMU is off (so it's device memory),
+    // and nothing else accesses it
+    unsafe { UniqueMmioPointer::new(NonNull::new_unchecked(UART0_BASE as *mut PL011Registers)) },
+));
+
+// GicV2::new isn't const, so the GIC is created in gic_init
+static GIC: IrqShared<Option<GicV2<'static>>> = IrqShared::new(None);
 
 fn uart_puts(s: &str) {
-    for byte in s.bytes() {
-        uart_putc(byte);
-    }
+    UART.with(|uart| uart.write_str(s).unwrap());
 }
 
-fn uart_put_hex(value: u32) {
-    for i in (0..8).rev() {
-        let nibble = ((value >> (i * 4)) & 0xF) as u8;
-        uart_putc(if nibble < 10 {
-            b'0' + nibble
-        } else {
-            b'A' + (nibble - 10)
-        });
-    }
+fn with_gic<R>(f: impl FnOnce(&mut GicV2<'static>) -> R) -> R {
+    GIC.with(|gic| f(gic.as_mut().expect("gic_init not called")))
 }
 
 fn sleep_ms(ms: u32) {
@@ -87,6 +98,7 @@ fn sleep_ms(ms: u32) {
 }
 
 // No `nomem` option, so these also act as compiler memory barriers
+// (arm_gic::irq_enable/irq_disable use `nomem`, so they don't)
 fn enable_interrupts() {
     unsafe {
         asm!("msr daifclr, #2", options(nostack));
@@ -99,20 +111,24 @@ fn disable_interrupts() {
     }
 }
 
-fn trigger_sgi(sgi_id: u32) {
-    // Bits [25:24]: Target List Filter (0b10 = forward strictly to the current requesting CPU core)
-    // Bits [3:0]: SGI Interrupt ID Number
-    unsafe {
-        write_volatile(GICD_SGIR, (2 << 24) | (sgi_id & 0xF));
-    }
+fn trigger_sgi(sgi_id: IntId) {
+    // Forward strictly to the current requesting CPU core
+    let target = SgiTarget::List {
+        target_list_filter: SgiTargetListFilter::ForwardSelfOnly,
+        target_list: 0,
+    };
+    with_gic(|gic| gic.send_sgi(sgi_id, target));
 }
 
 // The Unified Interrupt Vector Handler, called from irq_entry in startup.S
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_irq() {
     // Read the Interrupt Acknowledge Register to get the pending ID
-    let iar = unsafe { read_volatile(GICC_IAR) };
-    let interrupt_id = iar & 0x3FF; // Isolate lower 10 bits
+    let Some(interrupt_id) =
+        with_gic(|gic| gic.get_and_acknowledge_interrupt(InterruptGroup::Group0))
+    else {
+        return; // Spurious interrupt (ID 1023), nothing to end
+    };
 
     if interrupt_id == HW_INT_SGI_ID {
         uart_puts("[ISR] 'Hardware' Interrupt tripped! Writing data to shared space...\r\n");
@@ -130,39 +146,40 @@ pub extern "C" fn handle_irq() {
         let local_copy = SHARED_DATA.load(Ordering::Relaxed);
 
         // Print proof of successful read
-        uart_puts("      Critical Read complete! Value is: 0x");
-        uart_put_hex(local_copy);
-        uart_puts("\r\n");
+        UART.with(|uart| {
+            write!(
+                uart,
+                "      Critical Read complete! Value is: 0x{local_copy:08X}\r\n"
+            )
+            .unwrap()
+        });
 
         enable_interrupts();
         // --- CRITICAL SECTION END ---
     }
 
     // Signal completion by writing back the processed ID to End of Interrupt register
-    unsafe {
-        write_volatile(GICC_EOIR, iar);
-    }
+    with_gic(|gic| gic.end_interrupt(interrupt_id, InterruptGroup::Group0));
 }
 
 fn gic_init() {
-    unsafe {
-        write_volatile(GICD_CTLR, 0); // Disable distributor for configuration
-        write_volatile(GICC_CTLR, 0); // Disable CPU interface for configuration
+    // SAFETY: These are the GICv2 distributor and CPU interface on QEMU virt, the MMU is off
+    // (so they're device memory), and this is the only driver instance
+    let mut gic = unsafe { GicV2::new(GIC_DIST_BASE as *mut Gicd, GIC_CPU_BASE as *mut Gicc) };
 
-        // Leave SGIs in Group 0 (the reset default). GICD_CTLR/GICC_CTLR = 1 only
-        // enable Group 0, and Group 1 interrupts can't be acknowledged via GICC_IAR
-        // without GICC_CTLR.AckCtl, which would cause an endless IRQ storm.
+    // QEMU virt's GIC has no Security Extensions unless run with `-M virt,secure=on`, so setup()
+    // puts every interrupt in Group 0, enables Group 0, and sets the priority mask to 0xFF.
+    // (Group 1 interrupts can't be acknowledged via GICC_IAR, which would cause an IRQ storm.)
+    gic.setup();
+    assert!(
+        !gic.typer().has_security_extension(),
+        "SGIs must be in Group 0"
+    );
 
-        // Enable SGI 1 and SGI 2 (Bits 1 and 2 in the first ISENABLER register)
-        write_volatile(GICD_ISENABLER, (1 << HW_INT_SGI_ID) | (1 << SW_INT_SGI_ID));
+    gic.enable_interrupt(HW_INT_SGI_ID, true).unwrap();
+    gic.enable_interrupt(SW_INT_SGI_ID, true).unwrap();
 
-        // Set Priority Mask Register to allow all interrupts through (0xFF)
-        write_volatile(GICC_PMR, 0xFF);
-
-        // Turn both the distributor and CPU interface back on
-        write_volatile(GICD_CTLR, 1);
-        write_volatile(GICC_CTLR, 1);
-    }
+    GIC.with(|g| *g = Some(gic));
 }
 
 #[unsafe(no_mangle)]
@@ -186,7 +203,17 @@ pub extern "C" fn main_app() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    uart_puts("\r\n!!! PANIC TRIGGERED IN RUST ENGINE !!!\r\n");
+fn panic(info: &PanicInfo) -> ! {
+    disable_interrupts();
+    // Take over the UART rather than going through UART.with, since the panic may have
+    // happened inside it. This never returns, so the interrupted access is never resumed.
+    // SAFETY: As for UART, and the previous owner is never used again
+    let mut uart = Uart::new(unsafe {
+        UniqueMmioPointer::new(NonNull::new_unchecked(UART0_BASE as *mut PL011Registers))
+    });
+    let _ = write!(
+        uart,
+        "\r\n!!! PANIC TRIGGERED IN RUST ENGINE !!!\r\n{info}\r\n"
+    );
     loop {}
 }

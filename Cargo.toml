@@ -8,3 +8,5 @@ name = "baremetal"
 path = "main.rs"
 
 [dependencies]
+arm-gic = "0.10.0"
+arm-pl011-uart = "0.5.1"
