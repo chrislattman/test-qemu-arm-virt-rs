@@ -13,7 +13,7 @@ core::arch::global_asm!(include_str!("startup.S"));
 
 // --- UART PL011 Constants ---
 const UART0_BASE: usize = 0x0900_0000;
-const UART0_DR: *mut u32 = (UART0_BASE + 0x00) as *mut u32;
+const UART0_DR: *mut u32 = UART0_BASE as *mut u32;
 const UART0_FR: *const u32 = (UART0_BASE + 0x18) as *const u32;
 const UART_FR_TXFF: u32 = 1 << 5;
 
@@ -22,12 +22,12 @@ const GIC_DIST_BASE: usize = 0x0800_0000; // Distributor Base Address
 const GIC_CPU_BASE: usize = 0x0801_0000; // CPU Interface Base Address
 
 // Distributor Registers
-const GICD_CTLR: *mut u32 = (GIC_DIST_BASE + 0x000) as *mut u32;
+const GICD_CTLR: *mut u32 = GIC_DIST_BASE as *mut u32;
 const GICD_ISENABLER: *mut u32 = (GIC_DIST_BASE + 0x100) as *mut u32;
 const GICD_SGIR: *mut u32 = (GIC_DIST_BASE + 0xF00) as *mut u32;
 
 // CPU Interface Registers
-const GICC_CTLR: *mut u32 = (GIC_CPU_BASE + 0x000) as *mut u32;
+const GICC_CTLR: *mut u32 = GIC_CPU_BASE as *mut u32;
 const GICC_PMR: *mut u32 = (GIC_CPU_BASE + 0x004) as *mut u32;
 const GICC_IAR: *const u32 = (GIC_CPU_BASE + 0x00C) as *const u32;
 const GICC_EOIR: *mut u32 = (GIC_CPU_BASE + 0x010) as *mut u32;
@@ -56,7 +56,11 @@ fn uart_puts(s: &str) {
 fn uart_put_hex(value: u32) {
     for i in (0..8).rev() {
         let nibble = ((value >> (i * 4)) & 0xF) as u8;
-        uart_putc(if nibble < 10 { b'0' + nibble } else { b'A' + (nibble - 10) });
+        uart_putc(if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'A' + (nibble - 10)
+        });
     }
 }
 
@@ -73,7 +77,9 @@ fn sleep_ms(ms: u32) {
     let ticks_needed = (frq / 1000) * ms as u64;
 
     loop {
-        unsafe { asm!("mrs {}, cntpct_el0", out(reg) current); }
+        unsafe {
+            asm!("mrs {}, cntpct_el0", out(reg) current);
+        }
         if (current - start) >= ticks_needed {
             break;
         }
@@ -82,17 +88,23 @@ fn sleep_ms(ms: u32) {
 
 // No `nomem` option, so these also act as compiler memory barriers
 fn enable_interrupts() {
-    unsafe { asm!("msr daifclr, #2", options(nostack)); }
+    unsafe {
+        asm!("msr daifclr, #2", options(nostack));
+    }
 }
 
 fn disable_interrupts() {
-    unsafe { asm!("msr daifset, #2", options(nostack)); }
+    unsafe {
+        asm!("msr daifset, #2", options(nostack));
+    }
 }
 
 fn trigger_sgi(sgi_id: u32) {
     // Bits [25:24]: Target List Filter (0b10 = forward strictly to the current requesting CPU core)
     // Bits [3:0]: SGI Interrupt ID Number
-    unsafe { write_volatile(GICD_SGIR, (2 << 24) | (sgi_id & 0xF)); }
+    unsafe {
+        write_volatile(GICD_SGIR, (2 << 24) | (sgi_id & 0xF));
+    }
 }
 
 // The Unified Interrupt Vector Handler, called from irq_entry in startup.S
@@ -109,7 +121,9 @@ pub extern "C" fn handle_irq() {
         // Instantly trigger our secondary nested "Software" interrupt handling line
         trigger_sgi(SW_INT_SGI_ID);
     } else if interrupt_id == SW_INT_SGI_ID {
-        uart_puts("[ISR] 'Software' Interrupt tripped! Processing data inside a Critical Section...\r\n");
+        uart_puts(
+            "[ISR] 'Software' Interrupt tripped! Processing data inside a Critical Section...\r\n",
+        );
 
         // --- CRITICAL SECTION BEGIN ---
         disable_interrupts(); // Lock out incoming requests safely
@@ -125,7 +139,9 @@ pub extern "C" fn handle_irq() {
     }
 
     // Signal completion by writing back the processed ID to End of Interrupt register
-    unsafe { write_volatile(GICC_EOIR, iar); }
+    unsafe {
+        write_volatile(GICC_EOIR, iar);
+    }
 }
 
 fn gic_init() {
