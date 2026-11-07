@@ -1,6 +1,6 @@
 # no_std Rust example for QEMU ARM "virt" machine with Cortex-A53 processor
 
-Run `rustup target add aarch64-unknown-none-softfloat` and `sudo apt install qemu-system-arm gdb-multiarch`
+Run `sudo apt install qemu-system-arm gdb-multiarch`
 
 Build and run (the QEMU commands live in `.cargo/config.toml`):
 
