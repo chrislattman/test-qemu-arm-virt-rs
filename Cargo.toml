@@ -8,5 +8,6 @@ name = "baremetal"
 path = "main.rs"
 
 [dependencies]
+aarch64-cpu = "12.0.0"
 arm-gic = "0.10.0"
 arm-pl011-uart = "0.5.1"

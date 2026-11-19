@@ -6,13 +6,14 @@
 use arm_gic::gicv2::registers::{Gicc, Gicd};
 use arm_gic::gicv2::{GicV2, SgiTarget, SgiTargetListFilter};
 use arm_gic::{IntId, InterruptGroup};
+use aarch64_cpu::asm::wfe;
+use aarch64_cpu::registers::{CNTFRQ_EL0, CNTPCT_EL0, DAIF, DAIFClr, DAIFSet, Read as _, Write as _};
 use arm_pl011_uart::{PL011Registers, Uart, UniqueMmioPointer};
-use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering, compiler_fence};
 
 // Core Entry Point Setup
 core::arch::global_asm!(include_str!("startup.S"));
@@ -44,15 +45,12 @@ impl<T> IrqShared<T> {
     /// Runs `f` with IRQs masked, then restores the previous mask (so it's safe inside handle_irq).
     /// `f` must not call `with` on the same value again.
     fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        let daif: u64;
-        // No `nomem` option, so these also act as compiler memory barriers
-        unsafe {
-            asm!("mrs {}, daif", "msr daifset, #2", out(reg) daif, options(nostack));
-        }
+        let daif = DAIF.get();
+        disable_interrupts();
         let result = f(unsafe { &mut *self.0.get() });
-        unsafe {
-            asm!("msr daif, {}", in(reg) daif, options(nostack));
-        }
+        // Keep f's memory accesses before the restore (see enable_interrupts)
+        compiler_fence(Ordering::SeqCst);
+        DAIF.set(daif);
         result
     }
 }
@@ -76,39 +74,23 @@ fn with_gic<R>(f: impl FnOnce(&mut GicV2<'static>) -> R) -> R {
 }
 
 fn sleep_ms(ms: u32) {
-    let frq: u64;
-    let start: u64;
-    let mut current: u64;
+    let start = CNTPCT_EL0.get();
+    let ticks_needed = (CNTFRQ_EL0.get() / 1000) * ms as u64;
 
-    unsafe {
-        asm!("mrs {}, cntfrq_el0", out(reg) frq);
-        asm!("mrs {}, cntpct_el0", out(reg) start);
-    }
-
-    let ticks_needed = (frq / 1000) * ms as u64;
-
-    loop {
-        unsafe {
-            asm!("mrs {}, cntpct_el0", out(reg) current);
-        }
-        if (current - start) >= ticks_needed {
-            break;
-        }
-    }
+    while CNTPCT_EL0.get() - start < ticks_needed {}
 }
 
-// No `nomem` option, so these also act as compiler memory barriers
-// (arm_gic::irq_enable/irq_disable use `nomem`, so they don't)
+// aarch64-cpu's register accesses use `nomem`, so they aren't compiler memory barriers on their
+// own: the fences keep memory accesses from moving out of the region with IRQs masked
+// (the same pattern as aarch64-cpu's own critical-section implementation)
 fn enable_interrupts() {
-    unsafe {
-        asm!("msr daifclr, #2", options(nostack));
-    }
+    compiler_fence(Ordering::SeqCst);
+    DAIFClr.write(DAIFClr::I::Unmask);
 }
 
 fn disable_interrupts() {
-    unsafe {
-        asm!("msr daifset, #2", options(nostack));
-    }
+    DAIFSet.write(DAIFSet::I::Mask);
+    compiler_fence(Ordering::SeqCst);
 }
 
 fn trigger_sgi(sgi_id: IntId) {
@@ -215,5 +197,7 @@ fn panic(info: &PanicInfo) -> ! {
         uart,
         "\r\n!!! PANIC TRIGGERED IN RUST ENGINE !!!\r\n{info}\r\n"
     );
-    loop {}
+    loop {
+        wfe();
+    }
 }

@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "aarch64-cpu"
+version = "12.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d29c35ddc46f9490b91fe6271e848f68ff5b04f9df8e5416457abd05ab2ddf9"
+dependencies = [
+ "arm-targets",
+ "tock-registers",
+]
+
+[[package]]
 name = "arm-gic"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -82,6 +92,12 @@ dependencies = [
  "arm-sysregs-el0",
  "bitflags",
 ]
+
+[[package]]
+name = "arm-targets"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0555f30eb9cd1a07d7677d01971da6c74cbbb0f73f0667cbee74e590a68a619"
 
 [[package]]
 name = "bitflags"
@@ -203,6 +219,7 @@ dependencies = [
 name = "test-qemu-arm-virt-rs"
 version = "0.1.0"
 dependencies = [
+ "aarch64-cpu",
  "arm-gic",
  "arm-pl011-uart",
 ]
@@ -226,6 +243,12 @@ dependencies = [
  "quote",
  "syn 3.0.9",
 ]
+
+[[package]]
+name = "tock-registers"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc2477fb5e50cca83e3c38fd91757ffd87382baf2a3e032f10e9b29a9a50474b"
 
 [[package]]
 name = "unicode-ident"
